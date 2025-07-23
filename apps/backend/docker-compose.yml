@@ -1,0 +1,14 @@
+services:
+  db:
+    image: postgres
+    restart: always
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: Sarthak123
+      POSTGRES_DB: Chat-App
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+volumes:
+  pgdata:
