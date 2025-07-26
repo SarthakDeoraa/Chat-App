@@ -14,6 +14,7 @@ model User {
   username      String         @unique
   name          String
   avatar        String?        @default("https://i.pinimg.com/1200x/4b/90/5b/4b905b1342b5635310923fd10319c265.jpg")
+  password      String
   createdAt     DateTime       @default(now())
   conversations Participant[]
   messages      Message[]
@@ -38,6 +39,7 @@ model Participant {
   user           User         @relation(fields: [userId], references: [id])
   conversation   Conversation @relation(fields: [conversationId], references: [id])
   joinedAt       DateTime     @default(now())
+  isAdmin        Boolean      @default(false)
 
   @@unique([userId, conversationId])
 }

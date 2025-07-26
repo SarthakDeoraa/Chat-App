@@ -1,13 +1,13 @@
-import { PrismaClient } from "@prisma/client";
+import { prisma } from "../lib/prisma";
 import bcrypt from "bcrypt";
 import { generateToken } from "../utils/jwt";
 import { SignupInput } from "../validations/auth";
 
-const prisma = new PrismaClient();
+
 
 export async function signupService(data: SignupInput) {
   //checking if user exists first
-  const existing = await prisma.user.findUinque({
+  const existing = await prisma.user.findUnique({
     where: {
       email: data.email,
     },
@@ -31,7 +31,7 @@ export async function signupService(data: SignupInput) {
 
 export async function loginService(email: string, password: string) {
   //checking if user exists
-  const user = await prisma.user.findUinque({
+  const user = await prisma.user.findUnique({
     where: {
       email: email,
     },
