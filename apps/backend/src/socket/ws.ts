@@ -1,163 +1,194 @@
-import { WebSocketServer } from "ws";
+import { WebSocketServer, WebSocket, RawData } from "ws";
 import { verifyToken } from "../utils/jwt";
 import { prisma } from "../lib/prisma";
 import { Server } from "http";
 
+interface MyWebSocket extends WebSocket {
+  userId?: string;
+  isAlive?: boolean;
+}
 
-
-// Map userId to WebSocket
-const userSockets = new Map<string, any>();
-// Track online users
+const userSockets = new Map<string, MyWebSocket>();
 const onlineUsers = new Set<string>();
 
 export function setupWebSocketServer(server: Server) {
   const wss = new WebSocketServer({ server });
 
-  wss.on("connection", async (ws, req) => {
-    let authenticatedUserId: string | null = null;
+  // Heartbeat every 30 sec
+  setInterval(() => {
+    wss.clients.forEach((ws: MyWebSocket) => {
+      if (!ws.isAlive) {
+        ws.terminate();
+        handleDisconnect(ws);
+      } else {
+        ws.isAlive = false;
+        ws.ping();
+      }
+    });
+  }, 30000);
+
+  wss.on("connection", (ws: MyWebSocket) => {
+    ws.isAlive = true;
+    ws.on("pong", () => ws.isAlive = true);
+
+    // Auth timeout if token not sent in 10 sec
+    const authTimeout = setTimeout(() => {
+      if (!ws.userId) ws.close(4002, "No token provided");
+    }, 10000);
+
+    // Wait for first message (token)
     ws.once("message", async (data) => {
+      clearTimeout(authTimeout);
+
       try {
         const { token } = JSON.parse(data.toString());
-        const payload = verifyToken(token);
-        const user = await prisma.user.findUnique({ where: { id: payload.userId } });
-        if (!user) {
-          ws.close(4001, "Invalid user");
-          return;
-        }
-        authenticatedUserId = user.id;
-        userSockets.set(user.id, ws);
-        onlineUsers.add(user.id);
+        const { userId } = verifyToken(token) as { userId: string };
+
+        const user = await prisma.user.findUnique({ where: { id: userId } });
+        if (!user) return ws.close(4001, "User not found");
+
+        // Close old socket if user already connected
+        const existing = userSockets.get(userId);
+        if (existing) existing.close(4004, "Reconnected");
+
+        ws.userId = userId;
+        userSockets.set(userId, ws);
+        onlineUsers.add(userId);
+
         ws.send(JSON.stringify({ type: "auth:success" }));
 
-        // Send current online status to the newly connected user
-        await sendOnlineStatusToUser(user.id, ws);
+        sendOnlineFriends(ws);
+        notifyFriendsOnlineStatus(userId, true);
 
-        // Broadcast online status to contacts and group members
-        await broadcastOnlineStatus(user.id, true);
+        ws.on("message", (data) => handleMessage(ws, data));
+        ws.on("close", () => handleDisconnect(ws));
+        ws.on("error", () => handleDisconnect(ws));
 
-        // Listen for further messages (typing, etc.)
-        ws.on("message", async (msg) => {
-          if (!authenticatedUserId) return;
-          let parsed;
-          try {
-            parsed = JSON.parse(msg.toString());
-          } catch (e) {
-            return;
-          }
-          if (!parsed.type || !parsed.payload) return;
-
-          if (parsed.type === "typing:start" || parsed.type === "typing:stop") {
-            const { conversationId } = parsed.payload;
-            if (!conversationId) return;
-            // Check if user is a participant
-            const isParticipant = await prisma.participant.findUnique({
-              where: { userId_conversationId: { userId: authenticatedUserId, conversationId } },
-            });
-            if (!isParticipant) return;
-            // Broadcast to all other participants
-            const participants = await prisma.participant.findMany({
-              where: { conversationId },
-              select: { userId: true },
-            });
-            for (const { userId } of participants) {
-              if (userId === authenticatedUserId) continue;
-              const otherWs = userSockets.get(userId);
-              if (otherWs && otherWs.readyState === otherWs.OPEN) {
-                otherWs.send(JSON.stringify({
-                  type: "typing:update",
-                  payload: {
-                    conversationId,
-                    userId: authenticatedUserId,
-                    isTyping: parsed.type === "typing:start",
-                  },
-                }));
-              }
-            }
-          }
-        });
       } catch (err) {
         ws.close(4000, "Invalid token");
       }
     });
-    ws.on("close", async () => {
-      if (authenticatedUserId) {
-        userSockets.delete(authenticatedUserId);
-        onlineUsers.delete(authenticatedUserId);
-        // Broadcast offline status
-        await broadcastOnlineStatus(authenticatedUserId, false);
-      }
-    });
   });
 }
 
-async function broadcastOnlineStatus(userId: string, isOnline: boolean) {
-  // Get all users who have conversations with this user
-  const conversations = await prisma.participant.findMany({
-    where: { userId },
-    select: { conversationId: true },
-  });
-  const conversationIds = conversations.map((c: any) => c.conversationId);
-  
-  // Get all participants in these conversations
-  const participants = await prisma.participant.findMany({
-    where: { conversationId: { in: conversationIds } },
-    select: { userId: true },
-  });
-  
-  // Broadcast to all participants (except the user themselves)
-  for (const { userId: participantId } of participants) {
-    if (participantId === userId) continue;
-    const ws = userSockets.get(participantId);
-    if (ws && ws.readyState === ws.OPEN) {
-      ws.send(JSON.stringify({
-        type: isOnline ? "user:online" : "user:offline",
-        payload: { userId },
-      }));
+async function handleMessage(ws: MyWebSocket, data: RawData) {
+  if (!ws.userId) return;
+
+  try {
+    const { type, payload } = JSON.parse(data.toString());
+
+    if (type === "typing:start" || type === "typing:stop") {
+      const { conversationId } = payload;
+
+      const isParticipant = await prisma.participant.findUnique({
+        where: { userId_conversationId: { userId: ws.userId, conversationId } },
+      });
+
+      if (!isParticipant) return;
+
+      const others = await prisma.participant.findMany({
+        where: { conversationId },
+        select: { userId: true },
+      });
+
+      const msg = JSON.stringify({
+        type: "typing:update",
+        payload: {
+          userId: ws.userId,
+          conversationId,
+          isTyping: type === "typing:start",
+        },
+      });
+
+      others
+        .filter(({ userId }) => userId !== ws.userId)
+        .forEach(({ userId }) => {
+          const userWs = userSockets.get(userId);
+          if (userWs?.readyState === WebSocket.OPEN) userWs.send(msg);
+        });
     }
+
+  } catch (err) {
+    console.error("Invalid message", err);
   }
 }
 
-async function sendOnlineStatusToUser(userId: string, ws: any) {
+function handleDisconnect(ws: MyWebSocket) {
+  if (!ws.userId) return;
+  userSockets.delete(ws.userId);
+  onlineUsers.delete(ws.userId);
+  notifyFriendsOnlineStatus(ws.userId, false);
+}
+
+async function notifyFriendsOnlineStatus(userId: string, isOnline: boolean) {
   const conversations = await prisma.participant.findMany({
     where: { userId },
     select: { conversationId: true },
   });
-  const conversationIds = conversations.map((c: any) => c.conversationId);
 
-  const onlineUserIds = Array.from(onlineUsers);
+  const conversationIds = conversations.map(c => c.conversationId);
+
+  const friends = await prisma.participant.findMany({
+    where: { conversationId: { in: conversationIds } },
+    select: { userId: true },
+  });
+
+  const message = JSON.stringify({
+    type: isOnline ? "user:online" : "user:offline",
+    payload: { userId },
+  });
+
+  friends
+    .filter(f => f.userId !== userId)
+    .forEach(f => {
+      const ws = userSockets.get(f.userId);
+      if (ws?.readyState === WebSocket.OPEN) ws.send(message);
+    });
+}
+
+async function sendOnlineFriends(ws: MyWebSocket) {
+  if (!ws.userId) return;
+
+  const conversations = await prisma.participant.findMany({
+    where: { userId: ws.userId },
+    select: { conversationId: true },
+  });
+
+  const friends = await prisma.participant.findMany({
+    where: {
+      conversationId: { in: conversations.map(c => c.conversationId) },
+    },
+    select: { userId: true },
+  });
+
+  const online = friends
+    .map(f => f.userId)
+    .filter(id => id !== ws.userId && onlineUsers.has(id));
 
   ws.send(JSON.stringify({
     type: "users:online",
-    payload: {
-      userId,
-      onlineUserIds,
-    },
+    payload: { onlineUserIds: online },
   }));
 }
 
+// Export functions for broadcasting messages
 export async function broadcastToConversation(conversationId: string, messageObj: any) {
   const participants = await prisma.participant.findMany({
     where: { conversationId },
     select: { userId: true },
   });
-  for (const { userId } of participants) {
-    const ws = userSockets.get(userId);
-    if (ws && ws.readyState === ws.OPEN) {
-      ws.send(JSON.stringify(messageObj));
-    }
-  }
-} 
 
-export async function broadcastToGroup(groupId: string, eventObj: any) {
-  // groupId is the conversationId for group chats
-  const participants = await prisma.participant.findMany({
-    where: { conversationId: groupId },
-    select: { userId: true },
-  });
-  for (const { userId } of participants) {
+  const message = JSON.stringify(messageObj);
+  
+  participants.forEach(({ userId }) => {
     const ws = userSockets.get(userId);
-    if (ws && ws.readyState === ws.OPEN) {
-      ws.send(JSON.stringify(eventObj));
-    }
-  }
-} 
+    if (ws?.readyState === WebSocket.OPEN) ws.send(message);
+  });
+}
+
+export const broadcastToGroup = broadcastToConversation;
+
+// Utility functions
+export const isUserOnline = (userId: string) => onlineUsers.has(userId);
+export const getOnlineUsers = () => Array.from(onlineUsers);
+export const getConnectedSocketCount = () => userSockets.size;
